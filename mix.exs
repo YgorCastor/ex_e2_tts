@@ -26,6 +26,7 @@ defmodule ExE2Tts.MixProject do
       {:exla, "~> 0.9"},
       {:axon, "~> 0.7"},
       {:torchx, "~> 0.9"},
+      {:polaris, github: "elixir-nx/polaris", branch: "main", override: true},
       # Utilities
       {:jason, "~> 1.4"},
       {:flow, "~> 1.2"},
