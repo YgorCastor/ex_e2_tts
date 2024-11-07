@@ -7,7 +7,7 @@ defmodule ExE2Tts.Model.UNetT do
 
   import Axon
 
-  alias ExE2Tts.Model.{Transformer, TextEmbedding}
+  alias ExE2Tts.Model.{RotaryEmbedding, Transformer, TextEmbedding}
 
   @doc """
   Creates the complete UNetT model.
@@ -31,8 +31,11 @@ defmodule ExE2Tts.Model.UNetT do
           dim: config.dim,
           depth: config.depth,
           heads: config.heads,
+          dim_head: 64,
           ff_mult: config.ff_mult,
           mel_dim: ExE2Tts.Config.n_mel_channels(),
+          dropout: 0.1,
+          conv_layers: 0,
           skip_connect_type: :concat,
           vocab_size: opts[:vocab_size] || raise(ArgumentError, "vocab_size is required")
         ],
@@ -49,16 +52,24 @@ defmodule ExE2Tts.Model.UNetT do
     input_text = input("text", shape: {nil, nil}, type: :s64)
     input_time = input("time", shape: {nil})
 
-    # Process inputs
-    mel_features = process_mel(input_mel, opts[:dim])
+    # Process inputs with additional features
+    mel_features =
+      input_mel
+      |> process_mel(opts[:dim])
+      |> add_conv_layers(opts[:conv_layers], opts[:dim], opts[:dropout])
 
     text_features =
       TextEmbedding.create(input_text,
         vocab_size: opts[:vocab_size],
-        dim: opts[:dim]
+        dim: opts[:dim],
+        # Pass through conv_layers option
+        conv_layers: opts[:conv_layers]
       )
 
     time_features = process_time(input_time, opts[:dim])
+
+    # Initialize rotary embeddings
+    rotary = RotaryEmbedding.new(opts[:dim_head])
 
     # Combine features and append time token
     combined = combine_features(mel_features, text_features, time_features)
@@ -67,15 +78,16 @@ defmodule ExE2Tts.Model.UNetT do
     half_depth = div(opts[:depth], 2)
 
     # First half of the network (down path)
-    {down_features, skips} = build_down_path(combined, half_depth, opts)
+    {down_features, skips} = build_down_path(combined, half_depth, rotary, opts)
 
     # Second half of the network (up path with skip connections)
-    output = build_up_path(down_features, skips, half_depth, opts)
+    output = build_up_path(down_features, skips, half_depth, rotary, opts)
 
     # Final processing
     output =
       output
       |> layer_norm(epsilon: 1.0e-6, name: "final_norm")
+      |> dropout(rate: opts[:dropout], name: "final_dropout")
       |> dense(opts[:mel_dim], name: "output_projection")
 
     # Build model
@@ -95,6 +107,24 @@ defmodule ExE2Tts.Model.UNetT do
     |> activation(:silu)
     |> dense(dim, name: "time_proj2")
   end
+
+  defp add_conv_layers(input, conv_layers, dim, dropout_rate) when conv_layers > 0 do
+    Enum.reduce(1..conv_layers, input, fn i, acc ->
+      acc
+      |> conv(dim,
+        kernel_size: 3,
+        padding: :same,
+        use_bias: true,
+        channels: :last,
+        name: "conv_layer_#{i}",
+        activation: :mish
+      )
+      |> batch_norm(name: "conv_bn_#{i}")
+      |> dropout(rate: dropout_rate, name: "conv_dropout_#{i}")
+    end)
+  end
+
+  defp add_conv_layers(input, _conv_layers, _dim, _dropout_rate), do: input
 
   defp sinusoidal_position_embedding(input, dim) do
     layer(
@@ -135,14 +165,23 @@ defmodule ExE2Tts.Model.UNetT do
     )
   end
 
-  defp build_down_path(input, depth, opts) do
+  defp build_down_path(input, depth, rotary, opts) do
     Enum.reduce(1..depth, {input, []}, fn i, {features, skips} ->
-      # Apply transformer block
+      # Get sequence length for rotary embeddings
+      seq_len = elem(Nx.shape(features), 1)
+
+      # Get rotary embeddings for current sequence length
+      {freqs, _} = RotaryEmbedding.forward_from_seq_len(rotary, seq_len)
+
+      # Apply transformer block with rotary embeddings
       output =
         Transformer.create(features,
           dim: opts[:dim],
           heads: opts[:heads],
+          dim_head: opts[:dim_head],
+          dropout: opts[:dropout],
           ff_mult: opts[:ff_mult],
+          rotary_embeddings: freqs,
           name: "down_block_#{i}"
         )
 
@@ -151,23 +190,31 @@ defmodule ExE2Tts.Model.UNetT do
     end)
   end
 
-  defp build_up_path(input, skips, depth, opts) do
+  defp build_up_path(input, skips, depth, rotary, opts) do
     Enum.reduce(1..depth, {input, skips}, fn i, {features, [skip | remaining_skips]} ->
       # Apply skip connection
       features = apply_skip_connection(features, skip, opts[:skip_connect_type])
 
-      # Apply transformer block
+      # Get sequence length for rotary embeddings
+      seq_len = elem(Nx.shape(features), 1)
+
+      # Get rotary embeddings for current sequence length
+      {freqs, _} = RotaryEmbedding.forward_from_seq_len(rotary, seq_len)
+
+      # Apply transformer block with rotary embeddings
       output =
         Transformer.create(features,
           dim: opts[:dim],
           heads: opts[:heads],
+          dim_head: opts[:dim_head],
+          dropout: opts[:dropout],
           ff_mult: opts[:ff_mult],
+          rotary_embeddings: freqs,
           name: "up_block_#{i}"
         )
 
       {output, remaining_skips}
     end)
-    # Return just the features
     |> elem(0)
   end
 
